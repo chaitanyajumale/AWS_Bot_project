@@ -1,6 +1,6 @@
 # 🤖 Multi-Channel Bot Service
 
-A serverless chatbot platform built entirely on AWS Free Tier. This project demonstrates cloud-native development by processing 50K+ messages monthly at zero cost while maintaining sub-500ms response times.
+A serverless chatbot platform built on AWS. This project demonstrates cloud-native development by processing 50K+ messages monthly at zero cost while maintaining sub-500ms response times.
 
 ## What I Built
 
