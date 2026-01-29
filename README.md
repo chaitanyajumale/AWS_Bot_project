@@ -18,7 +18,6 @@ I wanted to understand how modern cloud applications work at scale, so I built a
 - Remembers conversation history for context
 - Works across different platforms (Slack, web, Telegram)
 - Never drops messages, even during traffic spikes
-- Costs $0 to run (seriously!)
 
 **Real impact:** The bot achieves 85% query resolution rate and handles everything asynchronously, which means it could theoretically handle thousands of users without any infrastructure changes.
 
@@ -56,9 +55,6 @@ Every conversation is stored in DynamoDB with timestamps. The bot remembers cont
 **Never Loses Messages**
 SQS guarantees message delivery. Even if Lambda functions fail or there's a traffic spike, messages wait in the queue until they're processed successfully.
 
-**Actually Free**
-Here's the magic: AWS gives you 1M Lambda requests, 1M SQS requests, and 25GB of DynamoDB storage every month for free. This bot uses about 15-20% of those limits even with heavy usage.
-
 ---
 
 ## Tech Stack
@@ -81,7 +77,7 @@ Here's the magic: AWS gives you 1M Lambda requests, 1M SQS requests, and 25GB of
 ## Getting Started
 
 **You'll need:**
-- AWS Account (free tier)
+- AWS Account
 - Python 3.11+
 - AWS CLI configured
 
@@ -172,15 +168,6 @@ Real numbers from testing:
 The coolest part? I load-tested it with 10,000 concurrent requests and it didn't break. Lambda just scaled up automatically.
 
 ---
-
-## Why It's Free
-
-AWS Free Tier is generous if you know how to use it:
-
-**My monthly usage vs. limits:**
-- Lambda: Using 150K requests out of 1M available (15%)
-- DynamoDB: Using 2.5GB out of 25GB available (10%)
-- SQS: Using 200K requests out of 1M available (20%)
 
 **How I optimized:**
 1. Set Lambda functions to 256-512MB memory (sweet spot for cost/performance)
