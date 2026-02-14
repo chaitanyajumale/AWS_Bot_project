@@ -86,3 +86,6 @@ lambda_*.zip
 # Documentation artifacts
 *.pdf
 *.docx
+
+# Node
+node_modules/
