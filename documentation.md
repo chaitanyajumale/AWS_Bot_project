@@ -1,4 +1,3 @@
-
 # Multi-Channel Bot Service — Documentation
 
 ## Table of Contents
