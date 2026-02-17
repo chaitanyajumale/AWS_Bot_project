@@ -1,4 +1,3 @@
-//Documentation
 
 # Multi-Channel Bot Service — Documentation
 
