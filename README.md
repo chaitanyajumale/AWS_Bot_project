@@ -197,14 +197,4 @@ Feel free to fork this and make it better! I'm open to pull requests if you want
 
 ---
 
-## Contact
-
-**Chaitanya** - MS Computer Science @ Northeastern University
-
-- LinkedIn: [your-profile](https://linkedin.com/in/yourprofile)
-- GitHub: [@yourusername](https://github.com/yourusername)
-- Email: your.email@northeastern.edu
-
----
-
 **Built with AWS Free Tier while learning cloud architecture. If you find this helpful, give it a star! ⭐**
