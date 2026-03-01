@@ -1,5 +1,5 @@
 # Multi-Channel Bot Service — Documentation
-d
+
 ## Table of Contents
 
 1. [Project Overview](#project-overview)
