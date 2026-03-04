@@ -325,3 +325,4 @@ $FUNCTION_URL | Out-File -FilePath "FUNCTION_URL.txt" -Encoding utf8
 Write-Host ""
 Write-Host "Function URL saved to: FUNCTION_URL.txt" -ForegroundColor Green
 Write-Host ""
+//
