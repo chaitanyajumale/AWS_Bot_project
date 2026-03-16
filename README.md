@@ -165,8 +165,6 @@ Real numbers from testing:
 - **Concurrent users:** Successfully tested with 1000+ simultaneous users
 - **Message loss:** Zero (SQS guarantees delivery)
 
-The coolest part? I load-tested it with 10,000 concurrent requests and it didn't break. Lambda just scaled up automatically.
-
 ---
 
 **How I optimized:**
@@ -189,12 +187,3 @@ This project taught me a ton about:
 - **Cost optimization** - Building production apps on free tier
 - **Asynchronous processing** - Handling concurrency at scale
 
----
-
-## Want to Contribute?
-
-Feel free to fork this and make it better! I'm open to pull requests if you want to add features or improve the NLP.
-
----
-
-**Built with AWS Free Tier while learning cloud architecture. If you find this helpful, give it a star! ⭐**
