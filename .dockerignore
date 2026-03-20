@@ -1,0 +1,10 @@
+node_modules
+.git
+*.md
+*.ps1
+*.sh
+FUNCTION_URL.txt
+trust-policy.json
+__pycache__
+*.pyc
+.env
