@@ -26,10 +26,29 @@ from bot_common.validation import validate_message_request
 SERVICE_NAME = "bot-message-router"
 logger = configure_logging(SERVICE_NAME)
 
-sqs = boto3.client("sqs")
-dynamodb = boto3.resource("dynamodb")
-
 CONVERSATION_TTL_DAYS = int(os.environ.get("CONVERSATION_TTL_DAYS", "30"))
+
+
+def _get_sqs():
+    g = globals()
+    if "sqs" not in g:
+        g["sqs"] = boto3.client("sqs")
+    return g["sqs"]
+
+
+def _get_dynamodb():
+    g = globals()
+    if "dynamodb" not in g:
+        g["dynamodb"] = boto3.resource("dynamodb")
+    return g["dynamodb"]
+
+
+def __getattr__(name):
+    if name == "sqs":
+        return _get_sqs()
+    if name == "dynamodb":
+        return _get_dynamodb()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _env(name: str, default: str = "") -> str:
@@ -117,7 +136,7 @@ def lambda_handler(event, context):
             "correlation_id": correlation_id,
         }
 
-        sqs_response = sqs.send_message(
+        sqs_response = _get_sqs().send_message(
             QueueUrl=_env("SQS_QUEUE_URL"),
             MessageBody=json.dumps(queue_message),
             MessageAttributes={
@@ -201,7 +220,7 @@ def generate_conversation_id(user_id, channel):
 
 
 def store_message(conversation_id, user_id, message, channel, direction, correlation_id):
-    table = dynamodb.Table(_env("CONVERSATIONS_TABLE", "Conversations"))
+    table = _get_dynamodb().Table(_env("CONVERSATIONS_TABLE", "Conversations"))
     timestamp = int(datetime.now().timestamp() * 1000)
     ttl = int(datetime.now().timestamp()) + (CONVERSATION_TTL_DAYS * 86400)
 

@@ -8,9 +8,18 @@ from typing import Any, Dict, Optional
 import boto3
 from botocore.exceptions import ClientError
 
-_dynamodb = boto3.resource("dynamodb")
-_table_name = os.environ.get("IDEMPOTENCY_TABLE", "IdempotencyKeys")
-_ttl_seconds = int(os.environ.get("IDEMPOTENCY_TTL_SECONDS", "86400"))
+_dynamodb = None
+
+
+def _get_table():
+    global _dynamodb
+    if _dynamodb is None:
+        _dynamodb = boto3.resource("dynamodb")
+    return _dynamodb.Table(os.environ.get("IDEMPOTENCY_TABLE", "IdempotencyKeys"))
+
+
+def _ttl() -> int:
+    return int(os.environ.get("IDEMPOTENCY_TTL_SECONDS", "86400"))
 
 
 def resolve_idempotency_key(headers: Optional[Dict[str, str]], body: Dict[str, Any]) -> Optional[str]:
@@ -23,7 +32,7 @@ def resolve_idempotency_key(headers: Optional[Dict[str, str]], body: Dict[str, A
 
 
 def get_cached_response(idempotency_key: str) -> Optional[Dict[str, Any]]:
-    table = _dynamodb.Table(_table_name)
+    table = _get_table()
     try:
         item = table.get_item(Key={"idempotency_key": idempotency_key}).get("Item")
         if not item:
@@ -34,8 +43,8 @@ def get_cached_response(idempotency_key: str) -> Optional[Dict[str, Any]]:
 
 
 def store_response(idempotency_key: str, response_body: Dict[str, Any]) -> None:
-    table = _dynamodb.Table(_table_name)
-    expires_at = int(time.time()) + _ttl_seconds
+    table = _get_table()
+    expires_at = int(time.time()) + _ttl()
     table.put_item(
         Item={
             "idempotency_key": idempotency_key,
@@ -49,8 +58,8 @@ def store_response(idempotency_key: str, response_body: Dict[str, Any]) -> None:
 
 def claim_processing_key(processing_key: str) -> bool:
     """Return True if this worker should process the message."""
-    table = _dynamodb.Table(_table_name)
-    expires_at = int(time.time()) + _ttl_seconds
+    table = _get_table()
+    expires_at = int(time.time()) + _ttl()
     try:
         table.put_item(
             Item={

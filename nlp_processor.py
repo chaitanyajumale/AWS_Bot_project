@@ -19,11 +19,22 @@ from bot_common.logging_utils import configure_logging, log_event
 SERVICE_NAME = "bot-nlp-processor"
 logger = configure_logging(SERVICE_NAME)
 
-dynamodb = boto3.resource("dynamodb")
-
 CONVERSATIONS_TABLE = os.environ.get("CONVERSATIONS_TABLE", "Conversations")
 SESSIONS_TABLE = os.environ.get("SESSIONS_TABLE", "UserSessions")
 CONVERSATION_TTL_DAYS = int(os.environ.get("CONVERSATION_TTL_DAYS", "30"))
+
+
+def _get_dynamodb():
+    g = globals()
+    if "dynamodb" not in g:
+        g["dynamodb"] = boto3.resource("dynamodb")
+    return g["dynamodb"]
+
+
+def __getattr__(name):
+    if name == "dynamodb":
+        return _get_dynamodb()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 INTENTS = {
     "greeting": r"\b(hi|hello|hey|greetings|good\s+(morning|afternoon|evening)|howdy|hiya)\b",
@@ -210,7 +221,7 @@ def generate_response(intent, user_message):
 
 
 def update_session(user_id, intent, channel):
-    table = dynamodb.Table(SESSIONS_TABLE)
+    table = _get_dynamodb().Table(SESSIONS_TABLE)
     current_time = int(datetime.now().timestamp())
 
     response = table.get_item(Key={"user_id": user_id})
@@ -235,7 +246,7 @@ def update_session(user_id, intent, channel):
 
 
 def store_bot_response(conversation_id, response, intent, confidence, correlation_id):
-    table = dynamodb.Table(CONVERSATIONS_TABLE)
+    table = _get_dynamodb().Table(CONVERSATIONS_TABLE)
     timestamp = int(datetime.now().timestamp() * 1000)
     ttl = int(datetime.now().timestamp()) + (CONVERSATION_TTL_DAYS * 86400)
 
