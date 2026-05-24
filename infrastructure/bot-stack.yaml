@@ -1,11 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: Multi-Channel Bot Service core infrastructure (DynamoDB, SQS + DLQ, IAM)
 
-Parameters:
-  ProjectName:
-    Type: String
-    Default: bot
-
 Resources:
   ConversationsTable:
     Type: AWS::DynamoDB::Table
