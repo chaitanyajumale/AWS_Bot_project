@@ -58,11 +58,53 @@ else
     echo "  ✓ Created UserSessions table"
 fi
 
+if ! aws dynamodb describe-table --table-name IdempotencyKeys --region $REGION 2>/dev/null; then
+    aws dynamodb create-table \
+        --table-name IdempotencyKeys \
+        --attribute-definitions AttributeName=idempotency_key,AttributeType=S \
+        --key-schema AttributeName=idempotency_key,KeyType=HASH \
+        --billing-mode PAY_PER_REQUEST \
+        --region $REGION > /dev/null
+    echo "  ✓ Created IdempotencyKeys table"
+else
+    echo "  ✓ IdempotencyKeys table already exists"
+fi
+
+if ! aws dynamodb describe-table --table-name RateLimits --region $REGION 2>/dev/null; then
+    aws dynamodb create-table \
+        --table-name RateLimits \
+        --attribute-definitions AttributeName=user_id,AttributeType=S AttributeName=window_start,AttributeType=N \
+        --key-schema AttributeName=user_id,KeyType=HASH AttributeName=window_start,KeyType=RANGE \
+        --billing-mode PAY_PER_REQUEST \
+        --region $REGION > /dev/null
+    echo "  ✓ Created RateLimits table"
+else
+    echo "  ✓ RateLimits table already exists"
+fi
+
+for table in Conversations UserSessions IdempotencyKeys RateLimits; do
+    aws dynamodb update-time-to-live \
+        --table-name "$table" \
+        --time-to-live-specification "Enabled=true, AttributeName=ttl" \
+        --region $REGION 2>/dev/null || true
+done
+
 echo ""
 
-# Step 2: Create SQS Queue (ALWAYS FREE)
-echo -e "${GREEN}[2/6] Creating SQS Queue (Always Free)...${NC}"
+# Step 2: Create SQS Queue + DLQ (ALWAYS FREE)
+echo -e "${GREEN}[2/7] Creating SQS Queue and DLQ (Always Free)...${NC}"
 
+DLQ_URL=$(aws sqs get-queue-url --queue-name bot-message-queue-dlq --region $REGION 2>/dev/null | jq -r '.QueueUrl' || echo "")
+if [ -z "$DLQ_URL" ]; then
+    DLQ_URL=$(aws sqs create-queue \
+        --queue-name bot-message-queue-dlq \
+        --attributes MessageRetentionPeriod=1209600 \
+        --region $REGION | jq -r '.QueueUrl')
+    echo "  ✓ Created DLQ"
+fi
+
+DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names QueueArn --region $REGION | jq -r '.Attributes.QueueArn')
+REDRIVE_POLICY=$(jq -nc --arg arn "$DLQ_ARN" '{deadLetterTargetArn:$arn,maxReceiveCount:3}')
 QUEUE_URL=$(aws sqs get-queue-url --queue-name bot-message-queue --region $REGION 2>/dev/null | jq -r '.QueueUrl' || echo "")
 
 if [ -z "$QUEUE_URL" ]; then
@@ -75,7 +117,13 @@ else
     echo "  ✓ SQS queue already exists"
 fi
 
+aws sqs set-queue-attributes \
+    --queue-url "$QUEUE_URL" \
+    --attributes "RedrivePolicy=$REDRIVE_POLICY" \
+    --region $REGION 2>/dev/null || true
+
 echo "  Queue URL: $QUEUE_URL"
+echo "  DLQ ARN:   $DLQ_ARN"
 echo ""
 
 # Step 3: Create IAM Role (FREE)
@@ -100,14 +148,11 @@ else
     aws iam attach-role-policy \
         --role-name $ROLE_NAME \
         --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-    
-    aws iam attach-role-policy \
+
+    aws iam put-role-policy \
         --role-name $ROLE_NAME \
-        --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
-    
-    aws iam attach-role-policy \
-        --role-name $ROLE_NAME \
-        --policy-arn arn:aws:iam::aws:policy/AmazonSQSFullAccess
+        --policy-name bot-least-privilege \
+        --policy-document file://infrastructure/iam-lambda-policy.json
     
     echo "  ✓ Created IAM role with policies"
     echo "  ⏳ Waiting 10 seconds for IAM role to propagate..."
@@ -115,6 +160,10 @@ else
 fi
 
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+aws iam put-role-policy \
+    --role-name $ROLE_NAME \
+    --policy-name bot-least-privilege \
+    --policy-document file://infrastructure/iam-lambda-policy.json 2>/dev/null || true
 echo ""
 
 # Step 4: Package and Deploy Lambda #1 - Message Router (ALWAYS FREE)
@@ -122,9 +171,12 @@ echo -e "${GREEN}[4/6] Deploying Lambda #1 - Message Router (Always Free)...${NC
 
 # Create deployment package
 mkdir -p /tmp/lambda_router
+cp -r bot_common /tmp/lambda_router/
 cp message_router_function_url.py /tmp/lambda_router/message_router.py
 cd /tmp/lambda_router
-zip -q lambda_router.zip message_router.py
+zip -qr lambda_router.zip .
+
+ROUTER_ENV="Variables={SQS_QUEUE_URL=$QUEUE_URL,CONVERSATIONS_TABLE=Conversations,IDEMPOTENCY_TABLE=IdempotencyKeys,RATE_LIMIT_TABLE=RateLimits,RATE_LIMIT_PER_MINUTE=60,CONVERSATION_TTL_DAYS=30}"
 
 if aws lambda get-function --function-name bot-message-router --region $REGION 2>/dev/null; then
     echo "  Updating bot-message-router function..."
@@ -135,7 +187,7 @@ if aws lambda get-function --function-name bot-message-router --region $REGION 2
     
     aws lambda update-function-configuration \
         --function-name bot-message-router \
-        --environment Variables="{SQS_QUEUE_URL=$QUEUE_URL,CONVERSATIONS_TABLE=Conversations}" \
+        --environment "$ROUTER_ENV" \
         --region $REGION > /dev/null
     
     echo "  ✓ Updated bot-message-router"
@@ -147,7 +199,7 @@ else
         --handler message_router.lambda_handler \
         --role $ROLE_ARN \
         --zip-file fileb://lambda_router.zip \
-        --environment Variables="{SQS_QUEUE_URL=$QUEUE_URL,CONVERSATIONS_TABLE=Conversations}" \
+        --environment "$ROUTER_ENV" \
         --timeout 30 \
         --memory-size 512 \
         --region $REGION > /dev/null
@@ -162,10 +214,13 @@ echo ""
 # Step 5: Package and Deploy Lambda #2 - NLP Processor (ALWAYS FREE)
 echo -e "${GREEN}[5/6] Deploying Lambda #2 - NLP Processor (Always Free)...${NC}"
 
+NLP_ENV="Variables={CONVERSATIONS_TABLE=Conversations,SESSIONS_TABLE=UserSessions,IDEMPOTENCY_TABLE=IdempotencyKeys,CONVERSATION_TTL_DAYS=30}"
+
 mkdir -p /tmp/lambda_processor
+cp -r bot_common /tmp/lambda_processor/
 cp nlp_processor.py /tmp/lambda_processor/
 cd /tmp/lambda_processor
-zip -q lambda_processor.zip nlp_processor.py
+zip -qr lambda_processor.zip .
 
 if aws lambda get-function --function-name bot-nlp-processor --region $REGION 2>/dev/null; then
     echo "  Updating bot-nlp-processor function..."
@@ -176,7 +231,7 @@ if aws lambda get-function --function-name bot-nlp-processor --region $REGION 2>
     
     aws lambda update-function-configuration \
         --function-name bot-nlp-processor \
-        --environment Variables="{CONVERSATIONS_TABLE=Conversations,SESSIONS_TABLE=UserSessions}" \
+        --environment "$NLP_ENV" \
         --region $REGION > /dev/null
     
     echo "  ✓ Updated bot-nlp-processor"
@@ -188,7 +243,7 @@ else
         --handler nlp_processor.lambda_handler \
         --role $ROLE_ARN \
         --zip-file fileb://lambda_processor.zip \
-        --environment Variables="{CONVERSATIONS_TABLE=Conversations,SESSIONS_TABLE=UserSessions}" \
+        --environment "$NLP_ENV" \
         --timeout 60 \
         --memory-size 1024 \
         --region $REGION > /dev/null
@@ -211,8 +266,15 @@ if [ -z "$MAPPING_UUID" ]; then
         --function-name bot-nlp-processor \
         --event-source-arn $QUEUE_ARN \
         --batch-size 10 \
+        --function-response-types ReportBatchItemFailures \
         --region $REGION > /dev/null
-    echo "  ✓ Connected SQS to Lambda"
+    echo "  ✓ Connected SQS to Lambda (partial batch failures enabled)"
+else
+    aws lambda update-event-source-mapping \
+        --uuid "$MAPPING_UUID" \
+        --function-response-types ReportBatchItemFailures \
+        --region $REGION 2>/dev/null || true
+    echo "  ✓ SQS already connected (partial batch failures ensured)"
 fi
 
 echo ""

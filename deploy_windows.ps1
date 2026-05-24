@@ -21,7 +21,7 @@ Write-Host "Region: $REGION" -ForegroundColor Yellow
 Write-Host ""
 
 # Step 1: Create DynamoDB Tables
-Write-Host "[1/6] Creating DynamoDB Tables..." -ForegroundColor Green
+Write-Host "[1/7] Creating DynamoDB Tables..." -ForegroundColor Green
 
 # Conversations table
 $conversationsCheck = aws dynamodb describe-table --table-name Conversations --region $REGION 2>$null
@@ -53,11 +53,61 @@ if ($sessionsCheck) {
     Write-Host "  * Created UserSessions table" -ForegroundColor Gray
 }
 
+# IdempotencyKeys table
+$idempotencyCheck = aws dynamodb describe-table --table-name IdempotencyKeys --region $REGION 2>$null
+if ($idempotencyCheck) {
+    Write-Host "  * IdempotencyKeys table already exists" -ForegroundColor Gray
+} else {
+    aws dynamodb create-table `
+        --table-name IdempotencyKeys `
+        --attribute-definitions AttributeName=idempotency_key,AttributeType=S `
+        --key-schema AttributeName=idempotency_key,KeyType=HASH `
+        --billing-mode PAY_PER_REQUEST `
+        --region $REGION | Out-Null
+    Write-Host "  * Created IdempotencyKeys table" -ForegroundColor Gray
+}
+
+# RateLimits table
+$rateLimitCheck = aws dynamodb describe-table --table-name RateLimits --region $REGION 2>$null
+if ($rateLimitCheck) {
+    Write-Host "  * RateLimits table already exists" -ForegroundColor Gray
+} else {
+    aws dynamodb create-table `
+        --table-name RateLimits `
+        --attribute-definitions AttributeName=user_id,AttributeType=S AttributeName=window_start,AttributeType=N `
+        --key-schema AttributeName=user_id,KeyType=HASH AttributeName=window_start,KeyType=RANGE `
+        --billing-mode PAY_PER_REQUEST `
+        --region $REGION | Out-Null
+    Write-Host "  * Created RateLimits table" -ForegroundColor Gray
+}
+
+foreach ($tableName in @("Conversations", "UserSessions", "IdempotencyKeys", "RateLimits")) {
+    aws dynamodb update-time-to-live `
+        --table-name $tableName `
+        --time-to-live-specification "Enabled=true, AttributeName=ttl" `
+        --region $REGION 2>$null | Out-Null
+}
+
 Write-Host ""
 
-# Step 2: Create SQS Queue
-Write-Host "[2/6] Creating SQS Queue..." -ForegroundColor Green
+# Step 2: Create SQS Queue + DLQ
+Write-Host "[2/7] Creating SQS Queue and DLQ..." -ForegroundColor Green
 
+$dlqCheck = aws sqs get-queue-url --queue-name bot-message-queue-dlq --region $REGION 2>$null
+if ($dlqCheck) {
+    $DLQ_URL = ($dlqCheck | ConvertFrom-Json).QueueUrl
+    Write-Host "  * DLQ already exists" -ForegroundColor Gray
+} else {
+    $dlqResult = aws sqs create-queue `
+        --queue-name bot-message-queue-dlq `
+        --attributes MessageRetentionPeriod=1209600 `
+        --region $REGION
+    $DLQ_URL = ($dlqResult | ConvertFrom-Json).QueueUrl
+    Write-Host "  * Created DLQ" -ForegroundColor Gray
+}
+
+$DLQ_ARN = (aws sqs get-queue-attributes --queue-url $DLQ_URL --attribute-names QueueArn --region $REGION | ConvertFrom-Json).Attributes.QueueArn
+$redrivePolicy = (@{ deadLetterTargetArn = $DLQ_ARN; maxReceiveCount = 3 } | ConvertTo-Json -Compress)
 $queueCheck = aws sqs get-queue-url --queue-name bot-message-queue --region $REGION 2>$null
 if ($queueCheck) {
     $queueData = $queueCheck | ConvertFrom-Json
@@ -74,11 +124,17 @@ if ($queueCheck) {
     Write-Host "  * Created SQS queue" -ForegroundColor Gray
 }
 
+aws sqs set-queue-attributes `
+    --queue-url $QUEUE_URL `
+    --attributes "RedrivePolicy=$redrivePolicy" `
+    --region $REGION 2>$null | Out-Null
+
 Write-Host "  Queue URL: $QUEUE_URL" -ForegroundColor Gray
+Write-Host "  DLQ ARN:   $DLQ_ARN" -ForegroundColor Gray
 Write-Host ""
 
 # Step 3: Create IAM Role
-Write-Host "[3/6] Creating IAM Role..." -ForegroundColor Green
+Write-Host "[3/7] Creating IAM Role..." -ForegroundColor Green
 
 $ROLE_NAME = "lambda-bot-execution-role"
 $roleCheck = aws iam get-role --role-name $ROLE_NAME 2>$null
@@ -109,14 +165,12 @@ if ($roleCheck) {
     aws iam attach-role-policy `
         --role-name $ROLE_NAME `
         --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-    
-    aws iam attach-role-policy `
+
+    $policyDoc = Get-Content -Raw -Path (Join-Path $PSScriptRoot "infrastructure\iam-lambda-policy.json")
+    aws iam put-role-policy `
         --role-name $ROLE_NAME `
-        --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
-    
-    aws iam attach-role-policy `
-        --role-name $ROLE_NAME `
-        --policy-arn arn:aws:iam::aws:policy/AmazonSQSFullAccess
+        --policy-name bot-least-privilege `
+        --policy-document $policyDoc | Out-Null
     
     Remove-Item "trust-policy.json" -ErrorAction SilentlyContinue
     
@@ -126,16 +180,22 @@ if ($roleCheck) {
 }
 
 $ROLE_ARN = "arn:aws:iam::$ACCOUNT_ID`:role/$ROLE_NAME"
+$policyDoc = Get-Content -Raw -Path (Join-Path $PSScriptRoot "infrastructure\iam-lambda-policy.json")
+aws iam put-role-policy `
+    --role-name $ROLE_NAME `
+    --policy-name bot-least-privilege `
+    --policy-document $policyDoc 2>$null | Out-Null
 Write-Host ""
 
 # Step 4: Deploy Lambda 1 - Message Router
-Write-Host "[4/6] Deploying Lambda 1 - Message Router..." -ForegroundColor Green
+Write-Host "[4/7] Deploying Lambda 1 - Message Router..." -ForegroundColor Green
 
 # Create temp directory
 $tempDir = Join-Path $env:TEMP "lambda_router_$(Get-Random)"
 New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
-# Copy file
+# Copy handler + shared package
+Copy-Item -Recurse (Join-Path $PSScriptRoot "bot_common") "$tempDir\bot_common"
 Copy-Item "message_router_function_url.py" "$tempDir\message_router.py"
 
 # Create ZIP
@@ -156,9 +216,11 @@ if ($functionCheck) {
     
     Start-Sleep -Seconds 2
     
+$routerEnv = "Variables={SQS_QUEUE_URL=$QUEUE_URL,CONVERSATIONS_TABLE=Conversations,IDEMPOTENCY_TABLE=IdempotencyKeys,RATE_LIMIT_TABLE=RateLimits,RATE_LIMIT_PER_MINUTE=60,CONVERSATION_TTL_DAYS=30}"
+
     aws lambda update-function-configuration `
         --function-name bot-message-router `
-        --environment "Variables={SQS_QUEUE_URL=$QUEUE_URL,CONVERSATIONS_TABLE=Conversations}" `
+        --environment $routerEnv `
         --region $REGION | Out-Null
     
     Write-Host "  * Updated bot-message-router" -ForegroundColor Gray
@@ -171,7 +233,7 @@ if ($functionCheck) {
         --handler message_router.lambda_handler `
         --role $ROLE_ARN `
         --zip-file "fileb://$zipPath" `
-        --environment "Variables={SQS_QUEUE_URL=$QUEUE_URL,CONVERSATIONS_TABLE=Conversations}" `
+        --environment $routerEnv `
         --timeout 30 `
         --memory-size 512 `
         --region $REGION | Out-Null
@@ -184,13 +246,13 @@ Remove-Item -Recurse -Force $tempDir
 Write-Host ""
 
 # Step 5: Deploy Lambda 2 - NLP Processor
-Write-Host "[5/6] Deploying Lambda 2 - NLP Processor..." -ForegroundColor Green
+Write-Host "[5/7] Deploying Lambda 2 - NLP Processor..." -ForegroundColor Green
 
 # Create temp directory
 $tempDir2 = Join-Path $env:TEMP "lambda_processor_$(Get-Random)"
 New-Item -ItemType Directory -Path $tempDir2 -Force | Out-Null
 
-# Copy file
+Copy-Item -Recurse (Join-Path $PSScriptRoot "bot_common") "$tempDir2\bot_common"
 Copy-Item "nlp_processor.py" "$tempDir2\nlp_processor.py"
 
 # Create ZIP
@@ -210,9 +272,11 @@ if ($nlpCheck) {
     
     Start-Sleep -Seconds 2
     
+$nlpEnv = "Variables={CONVERSATIONS_TABLE=Conversations,SESSIONS_TABLE=UserSessions,IDEMPOTENCY_TABLE=IdempotencyKeys,CONVERSATION_TTL_DAYS=30}"
+
     aws lambda update-function-configuration `
         --function-name bot-nlp-processor `
-        --environment "Variables={CONVERSATIONS_TABLE=Conversations,SESSIONS_TABLE=UserSessions}" `
+        --environment $nlpEnv `
         --region $REGION | Out-Null
     
     Write-Host "  * Updated bot-nlp-processor" -ForegroundColor Gray
@@ -225,7 +289,7 @@ if ($nlpCheck) {
         --handler nlp_processor.lambda_handler `
         --role $ROLE_ARN `
         --zip-file "fileb://$zipPath2" `
-        --environment "Variables={CONVERSATIONS_TABLE=Conversations,SESSIONS_TABLE=UserSessions}" `
+        --environment $nlpEnv `
         --timeout 60 `
         --memory-size 1024 `
         --region $REGION | Out-Null
@@ -257,16 +321,22 @@ if (-not $existing) {
         --function-name bot-nlp-processor `
         --event-source-arn $QUEUE_ARN `
         --batch-size 10 `
+        --function-response-types ReportBatchItemFailures `
         --region $REGION | Out-Null
-    Write-Host "  * Connected SQS to Lambda" -ForegroundColor Gray
+    Write-Host "  * Connected SQS to Lambda (partial batch failures enabled)" -ForegroundColor Gray
 } else {
-    Write-Host "  * SQS already connected" -ForegroundColor Gray
+    $mappingUuid = $existing.UUID
+    aws lambda update-event-source-mapping `
+        --uuid $mappingUuid `
+        --function-response-types ReportBatchItemFailures `
+        --region $REGION 2>$null | Out-Null
+    Write-Host "  * SQS already connected (partial batch failures ensured)" -ForegroundColor Gray
 }
 
 Write-Host ""
 
 # Step 6: Create Function URL
-Write-Host "[6/6] Creating Lambda Function URL..." -ForegroundColor Green
+Write-Host "[6/7] Creating Lambda Function URL..." -ForegroundColor Green
 
 $urlCheck = aws lambda get-function-url-config `
     --function-name bot-message-router `
@@ -282,7 +352,7 @@ if ($urlCheck) {
     $urlResult = aws lambda create-function-url-config `
         --function-name bot-message-router `
         --auth-type NONE `
-        --cors "AllowOrigins=*,AllowMethods=POST,AllowMethods=GET,AllowHeaders=Content-Type,MaxAge=86400" `
+        --cors "AllowOrigins=*,AllowMethods=POST,AllowMethods=GET,AllowHeaders=Content-Type,AllowHeaders=X-API-Key,AllowHeaders=X-Correlation-Id,AllowHeaders=Idempotency-Key,MaxAge=86400" `
         --region $REGION
     
     $urlData = $urlResult | ConvertFrom-Json

@@ -1,6 +1,7 @@
 # NLP processor Lambda — AWS Python 3.11 base (includes boto3)
 FROM public.ecr.aws/lambda/python:3.11
 
+COPY bot_common ${LAMBDA_TASK_ROOT}/bot_common/
 COPY nlp_processor.py ${LAMBDA_TASK_ROOT}/nlp_processor.py
 
 CMD [ "nlp_processor.lambda_handler" ]

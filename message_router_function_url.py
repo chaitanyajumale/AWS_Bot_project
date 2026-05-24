@@ -5,144 +5,223 @@ Works with Lambda Function URLs (no API Gateway needed - Always Free!)
 """
 
 import json
-import boto3
+import logging
 import os
 from datetime import datetime
 import hashlib
 
-# Initialize AWS clients
-sqs = boto3.client('sqs')
-dynamodb = boto3.resource('dynamodb')
+import boto3
 
-# Environment variables
-QUEUE_URL = os.environ.get('SQS_QUEUE_URL', '')
-CONVERSATIONS_TABLE = os.environ.get('CONVERSATIONS_TABLE', 'Conversations')
+from bot_common.auth import verify_api_key
+from bot_common.idempotency import (
+    get_cached_response,
+    resolve_idempotency_key,
+    store_response,
+)
+from bot_common.logging_utils import configure_logging, log_event, resolve_correlation_id
+from bot_common.rate_limit import check_rate_limit
+from bot_common.responses import api_response, error_response
+from bot_common.validation import validate_message_request
+
+SERVICE_NAME = "bot-message-router"
+logger = configure_logging(SERVICE_NAME)
+
+sqs = boto3.client("sqs")
+dynamodb = boto3.resource("dynamodb")
+
+CONVERSATION_TTL_DAYS = int(os.environ.get("CONVERSATION_TTL_DAYS", "30"))
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default)
+
 
 def lambda_handler(event, context):
-    """
-    Main handler for routing messages
-    Accepts messages from Lambda Function URL and routes to SQS
-    """
+    correlation_id = resolve_correlation_id(event, context)
+    aws_request_id = getattr(context, "aws_request_id", None)
+
     try:
-        print(f"Received event: {json.dumps(event)}")
-        
-        # Parse request body
-        if 'body' in event:
-            body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
-        else:
-            body = event
-        
-        # Extract channel from body (Function URL doesn't have path parameters)
-        channel = body.get('channel', 'web')
-        
-        # Extract message and user info based on channel
-        message = extract_message(body, channel)
-        user_id = extract_user_id(body, channel)
-        
-        if not message:
-            return response(400, {'error': 'No message provided'})
-        
-        # Generate unique conversation ID
-        conversation_id = generate_conversation_id(user_id, channel)
-        
-        # Store incoming message in DynamoDB
-        store_message(conversation_id, user_id, message, channel, 'inbound')
-        
-        # Prepare message for SQS
-        queue_message = {
-            'conversation_id': conversation_id,
-            'user_id': user_id,
-            'message': message,
-            'channel': channel,
-            'timestamp': int(datetime.now().timestamp())
-        }
-        
-        # Send to SQS for async processing
-        sqs_response = sqs.send_message(
-            QueueUrl=QUEUE_URL,
-            MessageBody=json.dumps(queue_message)
+        log_event(
+            logger,
+            logging.INFO,
+            "router.invocation",
+            correlation_id=correlation_id,
+            service=SERVICE_NAME,
+            aws_request_id=aws_request_id,
+            method=(event.get("requestContext") or {}).get("http", {}).get("method"),
+            path=event.get("rawPath"),
         )
-        
-        print(f"Message sent to SQS: {sqs_response['MessageId']}")
-        
-        return response(200, {
-            'status': 'queued',
-            'message_id': sqs_response['MessageId'],
-            'conversation_id': conversation_id,
-            'channel': channel
-        })
-        
-    except Exception as e:
-        print(f"Error in message router: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return response(500, {'error': str(e)})
+
+        http_method = (event.get("requestContext") or {}).get("http", {}).get("method", "POST")
+        if http_method == "GET":
+            return health_check(correlation_id)
+
+        headers = event.get("headers") or {}
+        authorized, auth_error = verify_api_key(headers)
+        if not authorized:
+            return error_response(
+                401,
+                "UNAUTHORIZED",
+                auth_error or "Unauthorized",
+                correlation_id=correlation_id,
+            )
+
+        body = parse_body(event)
+        idempotency_key = resolve_idempotency_key(headers, body)
+        if idempotency_key:
+            cached = get_cached_response(idempotency_key)
+            if cached:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "router.idempotency_hit",
+                    correlation_id=correlation_id,
+                    service=SERVICE_NAME,
+                    idempotency_key=idempotency_key,
+                )
+                return api_response(200, cached, correlation_id=correlation_id)
+
+        validated, errors = validate_message_request(body)
+        if errors:
+            return error_response(
+                400,
+                "VALIDATION_ERROR",
+                "Invalid request payload",
+                correlation_id=correlation_id,
+                details={"fields": errors},
+            )
+
+        assert validated is not None
+        channel = validated["channel"]
+        user_id = validated["user_id"]
+        message = validated["message"]
+
+        allowed, rate_error = check_rate_limit(user_id)
+        if not allowed:
+            return error_response(
+                429,
+                "RATE_LIMIT_EXCEEDED",
+                rate_error or "Too many requests",
+                correlation_id=correlation_id,
+            )
+
+        conversation_id = generate_conversation_id(user_id, channel)
+        store_message(conversation_id, user_id, message, channel, "inbound", correlation_id)
+
+        queue_message = {
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "message": message,
+            "channel": channel,
+            "timestamp": int(datetime.now().timestamp()),
+            "correlation_id": correlation_id,
+        }
+
+        sqs_response = sqs.send_message(
+            QueueUrl=_env("SQS_QUEUE_URL"),
+            MessageBody=json.dumps(queue_message),
+            MessageAttributes={
+                "correlation_id": {"DataType": "String", "StringValue": correlation_id},
+            },
+        )
+
+        response_body = {
+            "status": "queued",
+            "message_id": sqs_response["MessageId"],
+            "conversation_id": conversation_id,
+            "channel": channel,
+        }
+
+        if idempotency_key:
+            store_response(idempotency_key, response_body)
+
+        log_event(
+            logger,
+            logging.INFO,
+            "router.queued",
+            correlation_id=correlation_id,
+            service=SERVICE_NAME,
+            aws_request_id=aws_request_id,
+            conversation_id=conversation_id,
+            sqs_message_id=sqs_response["MessageId"],
+        )
+
+        return api_response(200, response_body, correlation_id=correlation_id)
+
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.ERROR,
+            "router.error",
+            correlation_id=correlation_id,
+            service=SERVICE_NAME,
+            aws_request_id=aws_request_id,
+            error=str(exc),
+            exc_info=True,
+        )
+        return error_response(
+            500,
+            "INTERNAL_ERROR",
+            "Failed to route message",
+            correlation_id=correlation_id,
+        )
 
 
-def extract_message(body, channel):
-    """Extract message content based on channel format"""
-    if channel == 'slack':
-        event = body.get('event', {})
-        return event.get('text', body.get('message', ''))
-    elif channel == 'telegram':
-        message_obj = body.get('message', {})
-        return message_obj.get('text', body.get('message', ''))
-    else:  # web or generic
-        return body.get('message', '')
+def health_check(correlation_id: str):
+    checks = {
+        "router": "ok",
+        "sqs_configured": bool(_env("SQS_QUEUE_URL")),
+        "dynamodb_table": _env("CONVERSATIONS_TABLE", "Conversations"),
+    }
+    status_code = 200 if checks["sqs_configured"] else 503
+    return api_response(
+        status_code,
+        {
+            "status": "healthy" if status_code == 200 else "degraded",
+            "service": SERVICE_NAME,
+            "checks": checks,
+        },
+        correlation_id=correlation_id,
+    )
 
 
-def extract_user_id(body, channel):
-    """Extract user ID based on channel format"""
-    if channel == 'slack':
-        event = body.get('event', {})
-        return event.get('user', body.get('user_id', 'unknown'))
-    elif channel == 'telegram':
-        message_obj = body.get('message', {})
-        from_obj = message_obj.get('from', {})
-        return str(from_obj.get('id', body.get('user_id', 'unknown')))
-    else:  # web
-        return body.get('user_id', body.get('userId', 'web_user'))
+def parse_body(event):
+    if "body" in event:
+        body = event["body"]
+        if isinstance(body, str):
+            return json.loads(body or "{}")
+        return body or {}
+    return event
 
 
 def generate_conversation_id(user_id, channel):
-    """Generate unique conversation ID per user per channel per day"""
-    date_str = datetime.now().strftime('%Y%m%d')
+    date_str = datetime.now().strftime("%Y%m%d")
     key = f"{user_id}_{channel}_{date_str}"
     return hashlib.md5(key.encode()).hexdigest()
 
 
-def store_message(conversation_id, user_id, message, channel, direction):
-    """Store message in DynamoDB conversations table"""
-    try:
-        table = dynamodb.Table(CONVERSATIONS_TABLE)
-        timestamp = int(datetime.now().timestamp() * 1000)
-        
-        item = {
-            'conversation_id': conversation_id,
-            'timestamp': timestamp,
-            'user_id': user_id,
-            'message': message,
-            'channel': channel,
-            'direction': direction
-        }
-        
-        table.put_item(Item=item)
-        print(f"Stored message in DynamoDB: {conversation_id}")
-        
-    except Exception as e:
-        print(f"Error storing message: {str(e)}")
-        pass
+def store_message(conversation_id, user_id, message, channel, direction, correlation_id):
+    table = dynamodb.Table(_env("CONVERSATIONS_TABLE", "Conversations"))
+    timestamp = int(datetime.now().timestamp() * 1000)
+    ttl = int(datetime.now().timestamp()) + (CONVERSATION_TTL_DAYS * 86400)
 
-
-def response(status_code, body):
-    """Generate Lambda Function URL response"""
-    return {
-        'statusCode': status_code,
-        'headers': {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type',
-            'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
-        },
-        'body': json.dumps(body)
+    item = {
+        "conversation_id": conversation_id,
+        "timestamp": timestamp,
+        "user_id": user_id,
+        "message": message,
+        "channel": channel,
+        "direction": direction,
+        "correlation_id": correlation_id,
+        "ttl": ttl,
     }
+
+    table.put_item(Item=item)
+    log_event(
+        logger,
+        logging.INFO,
+        "router.stored_inbound",
+        correlation_id=correlation_id,
+        service=SERVICE_NAME,
+        conversation_id=conversation_id,
+    )
