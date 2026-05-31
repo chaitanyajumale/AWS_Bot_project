@@ -214,7 +214,8 @@ def calculate_confidence(message, intent):
 
 def generate_response(intent, user_message):
     response_list = RESPONSES.get(intent, RESPONSES["default"])
-    base_response = random.choice(response_list)
+    # nosec B311: cosmetic choice of a canned reply, not a security context.
+    base_response = random.choice(response_list)  # nosec B311
     if intent == "question" and "?" in user_message:
         base_response += f"\n\nRegarding: '{user_message[:50]}...'"
     return base_response

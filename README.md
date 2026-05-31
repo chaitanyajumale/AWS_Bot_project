@@ -72,6 +72,47 @@ SQS guarantees message delivery. Even if Lambda functions fail or there's a traf
 - Regex-based NLP (no external ML libraries needed)
 - JSON for data exchange
 
+**Security (open source libraries):**
+- **`cryptography`** (pyca) - HMAC-SHA256 webhook signature verification
+- **`PyJWT`** - signed, expiring JWT bearer tokens
+- **`bandit`** + **`pip-audit`** - static analysis (SAST) and dependency CVE scanning in CI
+
+**Delivery:**
+- **Docker** - both Lambdas ship as container images (`Dockerfile.router`, `Dockerfile.nlp`)
+- **AWS ECR** - image registry the Lambdas pull from (see `DOCKER_ECR.md`)
+- **GitHub Actions** - CI runs unit tests, security scans, and CloudFormation linting on every push
+
+---
+
+## Security Model
+
+Authentication and message integrity are handled in one small, audited module
+(`bot_common/crypto.py`) built on well-maintained open source crypto libraries
+rather than hand-rolled code:
+
+| Concern | How it's handled |
+| --- | --- |
+| **API key auth** | Shared secret in `X-API-Key`/`Bearer`, compared with `hmac.compare_digest` (constant-time, timing-attack resistant) |
+| **Token auth** | Stateless HS256 **JWTs** via PyJWT, with enforced `exp`/`iat`/`iss` and `alg:none` rejection |
+| **Webhook integrity** | **HMAC-SHA256** signature over the raw body (`cryptography` library), verified in constant time — guards the Slack/Telegram webhook path |
+| **Identifiers** | Conversation IDs hashed with **SHA-256** (not MD5) |
+| **Transport / abuse** | HTTPS-only Function URLs, per-user DynamoDB rate limiting, idempotency keys |
+
+All three auth controls are **opt-in via environment variables** (`API_KEY`,
+`JWT_SECRET`, `WEBHOOK_SIGNING_SECRET`) so local development stays frictionless
+while production runs locked down.
+
+**Structured security testing**
+- `tests/test_crypto.py` / `tests/test_auth.py` cover constant-time comparison,
+  signature tampering, JWT expiry, wrong-secret, and `alg:none` forgery.
+- CI fails the build on any Bandit (SAST) finding or known dependency CVE.
+
+```bash
+pytest tests/ -v
+bandit -c pyproject.toml -r bot_common message_router_function_url.py nlp_processor.py
+pip-audit -r requirements.txt
+```
+
 ---
 
 ## Getting Started

@@ -24,6 +24,12 @@ jobs:
       - name: Run unit tests
         run: pytest tests/ -v
 
+      - name: Security scan - Bandit (SAST)
+        run: bandit -c pyproject.toml -r bot_common message_router_function_url.py nlp_processor.py
+
+      - name: Security scan - pip-audit (dependency CVEs)
+        run: pip-audit -r requirements.txt
+
       - name: Validate CloudFormation template
         run: |
           pip install cfn-lint

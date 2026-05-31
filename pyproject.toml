@@ -1,3 +1,12 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+filterwarnings = [
+    # Test secrets are intentionally short; production secrets come from env/SSM.
+    "ignore::jwt.warnings.InsecureKeyLengthWarning",
+]
+
+[tool.bandit]
+# B101: asserts in validation.py are type-narrowing guards for the type
+# checker, not runtime security controls — safe to skip.
+skips = ["B101"]

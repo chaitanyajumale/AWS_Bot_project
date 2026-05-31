@@ -1,0 +1,7 @@
+# Runtime dependencies for the Lambda container images.
+# boto3 ships in the AWS base image but is pinned here for local runs.
+boto3>=1.34.0
+
+# Open source cryptography / secure token handling.
+cryptography>=42.0.0   # pyca: HMAC-SHA256 webhook signature verification
+PyJWT>=2.8.0           # signed, expiring JWT bearer tokens

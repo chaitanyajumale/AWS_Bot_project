@@ -8,11 +8,11 @@ import json
 import logging
 import os
 from datetime import datetime
-import hashlib
 
 import boto3
 
 from bot_common.auth import verify_api_key
+from bot_common.crypto import stable_hash, verify_signature
 from bot_common.idempotency import (
     get_cached_response,
     resolve_idempotency_key,
@@ -82,6 +82,23 @@ def lambda_handler(event, context):
                 401,
                 "UNAUTHORIZED",
                 auth_error or "Unauthorized",
+                correlation_id=correlation_id,
+            )
+
+        signature_ok, signature_error = verify_webhook_signature(event, headers)
+        if not signature_ok:
+            log_event(
+                logger,
+                logging.WARNING,
+                "router.signature_rejected",
+                correlation_id=correlation_id,
+                service=SERVICE_NAME,
+                aws_request_id=aws_request_id,
+            )
+            return error_response(
+                401,
+                "INVALID_SIGNATURE",
+                signature_error or "Invalid webhook signature",
                 correlation_id=correlation_id,
             )
 
@@ -204,6 +221,40 @@ def health_check(correlation_id: str):
     )
 
 
+def verify_webhook_signature(event, headers):
+    """Verify an HMAC-SHA256 signature over the raw request body.
+
+    Gated on the ``WEBHOOK_SIGNING_SECRET`` env var: when unset the check is
+    skipped (open/dev mode); when set, the request must carry a matching
+    ``X-Signature`` / ``X-Hub-Signature-256`` header. The HMAC is computed
+    over the *raw* bytes the client signed, so we read ``event['body']``
+    before any JSON parsing.
+    """
+    signing_secret = os.environ.get("WEBHOOK_SIGNING_SECRET", "").strip()
+    if not signing_secret:
+        return True, None
+
+    raw_body = event.get("body")
+    if raw_body is None:
+        raw_body = ""
+    if not isinstance(raw_body, str):
+        raw_body = json.dumps(raw_body, separators=(",", ":"), sort_keys=True)
+    payload = raw_body.encode("utf-8")
+
+    normalized = {str(k).lower(): v for k, v in (headers or {}).items()}
+    provided = (
+        normalized.get("x-signature")
+        or normalized.get("x-hub-signature-256")
+        or normalized.get("x-slack-signature")
+    )
+    if not provided:
+        return False, "Missing webhook signature"
+
+    if verify_signature(signing_secret, payload, provided):
+        return True, None
+    return False, "Invalid webhook signature"
+
+
 def parse_body(event):
     if "body" in event:
         body = event["body"]
@@ -216,7 +267,8 @@ def parse_body(event):
 def generate_conversation_id(user_id, channel):
     date_str = datetime.now().strftime("%Y%m%d")
     key = f"{user_id}_{channel}_{date_str}"
-    return hashlib.md5(key.encode()).hexdigest()
+    # SHA-256 (not MD5): collision-resistant and clears weak-hash SAST checks.
+    return stable_hash(key)
 
 
 def store_message(conversation_id, user_id, message, channel, direction, correlation_id):

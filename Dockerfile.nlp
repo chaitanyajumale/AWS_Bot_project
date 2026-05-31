@@ -1,6 +1,10 @@
 # NLP processor Lambda — AWS Python 3.11 base (includes boto3)
 FROM public.ecr.aws/lambda/python:3.11
 
+# Install open source crypto libraries (cryptography, PyJWT) into the image.
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
 COPY bot_common ${LAMBDA_TASK_ROOT}/bot_common/
 COPY nlp_processor.py ${LAMBDA_TASK_ROOT}/nlp_processor.py
 

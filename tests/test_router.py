@@ -60,6 +60,45 @@ def test_queue_message_success():
     assert response["headers"]["X-Correlation-Id"]
 
 
+def test_webhook_signature_rejected_when_invalid():
+    body = json.dumps({"message": "Hi", "user_id": "user-1", "channel": "slack"})
+    event = {
+        "requestContext": {"http": {"method": "POST"}},
+        "headers": {"x-signature": "sha256=deadbeef"},
+        "body": body,
+    }
+    with patch.dict(
+        os.environ,
+        {"SQS_QUEUE_URL": "https://example.com/queue", "WEBHOOK_SIGNING_SECRET": "shhh"},
+        clear=False,
+    ):
+        response = router.lambda_handler(event, None)
+    assert response["statusCode"] == 401
+    assert json.loads(response["body"])["error"]["code"] == "INVALID_SIGNATURE"
+
+
+@mock_aws
+def test_webhook_signature_accepted_when_valid():
+    from bot_common.crypto import compute_signature
+
+    body = json.dumps({"message": "Hi", "user_id": "user-1", "channel": "slack"})
+    signature = compute_signature("shhh", body.encode("utf-8"))
+    event = {
+        "requestContext": {"http": {"method": "POST"}},
+        "headers": {"x-signature": signature},
+        "body": body,
+    }
+    with patch.dict(
+        os.environ,
+        {"SQS_QUEUE_URL": "https://example.com/queue", "WEBHOOK_SIGNING_SECRET": "shhh"},
+        clear=False,
+    ):
+        # Valid signature passes the gate; we don't need SQS to succeed here,
+        # only to get past the 401. A missing table surfaces as 500, not 401.
+        response = router.lambda_handler(event, None)
+    assert response["statusCode"] != 401
+
+
 def test_validation_error_response():
     event = {
         "requestContext": {"http": {"method": "POST"}},
